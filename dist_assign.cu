@@ -1,8 +1,14 @@
+#include "sbin.hh"
+
 #include <cuda_runtime.h>
 #include <iostream>
+#include <fstream>
+#include <cstring>
+#include <string>
 #include <cfloat>
 #include <vector>
 #include <random>
+#include <iomanip>
 
 // CUDA Error Macro
 #define CHECK_CUDA(call) { \
@@ -47,7 +53,7 @@ __global__ void assignClustersKernel(const float* __restrict__ points,
 
             for (int d = 0; d < D; ++d) {
                 // Access point from global memory, centroid from fast shared memory
-                float diff = points[point_idx * D + d] - s_centroids[k * D + d];
+                float diff = points[d * N + point_idx] - s_centroids[k * D + d];
                 current_dist += diff * diff; // Squared distance
             }
 
@@ -64,25 +70,53 @@ __global__ void assignClustersKernel(const float* __restrict__ points,
 }
 
 
-int main() {
-    // Define N, K, and D for a quick test
-    int N = 10000000; // Number of points
-    int K = 10;       // Number of clusters
-    int D = 8;        // Dimensions
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <data_bin_file> [K_override]\n";
+        return 1;
+    }
 
-    size_t points_size = N * D * sizeof(float);
-    size_t centroids_size = K * D * sizeof(float);
-    size_t assignments_size = N * sizeof(int);
+    SbinHeader header{};
+    {
+        std::ifstream in(argv[1], std::ios::binary);
+        if (!in) {
+            std::cerr << "Failed to open SBIN file: " << argv[1] << std::endl;
+            return 1;
+        }
+        in.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!in || std::memcmp(header.magic, "SBIN", 4) != 0) {
+            std::cerr << "Invalid SBIN header.\n";
+            return 1;
+        }
+    }
+
+    int N = static_cast<int>(header.n);
+    int D = static_cast<int>(header.d);
+    int K = static_cast<int>(header.k_meta > 0 ? header.k_meta : 10);
+    if (argc >= 3) {
+        K = std::stoi(argv[2]);
+    }
+
+    size_t points_size = static_cast<size_t>(N) * D * sizeof(float);
+    size_t centroids_size = static_cast<size_t>(K) * D * sizeof(float);
+    size_t assignments_size = static_cast<size_t>(N) * sizeof(int);
 
     // Host memory allocation
-    std::vector<float> h_points(N * D);
-    std::vector<float> h_centroids(K * D);
+    std::vector<float> h_points(static_cast<size_t>(N) * D);
+    std::vector<float> h_centroids(static_cast<size_t>(K) * D);
     std::vector<int> h_assignments(N);
 
-    // Initialize with dummy data
-    // TODO: Replace with actual CSV loading logic
-    for(int i = 0; i < N * D; ++i) h_points[i] = static_cast<float>(rand()) / RAND_MAX;
-    for(int i = 0; i < K * D; ++i) h_centroids[i] = static_cast<float>(rand()) / RAND_MAX;
+    // Load actual SBIN loading logic
+    if (!loadSbinSoA(argv[1], h_points.data(), N, D)) {
+        return 1;
+    }
+
+    // Initialize centroids using the first K points from the dataset
+    for(int k = 0; k < K; ++k) {
+        for(int d = 0; d < D; ++d) {
+            h_centroids[k * D + d] = h_points[d * N + k]; 
+        }
+    }
 
     // Device memory allocation
     float *d_points, *d_centroids;
@@ -91,8 +125,7 @@ int main() {
     CHECK_CUDA(cudaMalloc(&d_centroids, centroids_size));
     CHECK_CUDA(cudaMalloc(&d_assignments, assignments_size));
 
-    // Copy data to device
-    CHECK_CUDA(cudaMemcpy(d_points, h_points.data(), points_size, cudaMemcpyHostToDevice));
+    // Copy initial centroids to device
     CHECK_CUDA(cudaMemcpy(d_centroids, h_centroids.data(), centroids_size, cudaMemcpyHostToDevice));
 
     // Setup execution configuration
@@ -100,7 +133,7 @@ int main() {
     int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
     
     // Calculate shared memory size needed for centroids
-    size_t sharedMemSize = K * D * sizeof(float);
+    size_t sharedMemSize = static_cast<size_t>(K) * D * sizeof(float);
 
     // Calculate Occupancy
     cudaDeviceProp prop;
@@ -110,6 +143,7 @@ int main() {
     float occupancy = (numBlocksPerSM * threadsPerBlock) / (float)prop.maxThreadsPerMultiProcessor;
 
     std::cout << "--- Launch Configuration (Baseline) ---" << std::endl;
+    std::cout << "N=" << N << " D=" << D << " K=" << K << std::endl;
     std::cout << "Block Size: " << threadsPerBlock << std::endl;
     std::cout << "Theoretical Occupancy: " << std::fixed << std::setprecision(2) << (occupancy * 100.0f) << "%" << std::endl;
 
@@ -120,6 +154,9 @@ int main() {
 
     // Record start event on the default stream
     cudaEventRecord(start, 0);
+
+    // Copy points to device
+    CHECK_CUDA(cudaMemcpy(d_points, h_points.data(), points_size, cudaMemcpyHostToDevice));
 
     // Launch the kernel
     assignClustersKernel<<<blocksPerGrid, threadsPerBlock, sharedMemSize>>>(
