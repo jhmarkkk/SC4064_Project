@@ -73,7 +73,7 @@ __global__ void assignClustersKernel_Opt(
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <data_bin_file> [K_override]\n";
+        std::cerr << "Usage: " << argv[0] << " <data_bin_file> [K_override] [Seed]\n";
         return 1;
     }
 
@@ -98,6 +98,12 @@ int main(int argc, char** argv) {
         K = std::stoi(argv[2]);
     }
 
+    // Parse Seed Argument
+    int seed = 42; 
+    if (argc >= 4) {
+        seed = std::stoi(argv[3]);
+    }
+
     size_t total_points_bytes = static_cast<size_t>(N) * D * sizeof(float);
     size_t total_assign_bytes = static_cast<size_t>(N) * sizeof(int);
     size_t centroids_bytes = static_cast<size_t>(K) * D * sizeof(float);
@@ -114,10 +120,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Initialize centroids using the first K points
+    // Initialize centroids by uniformly selecting K points from the dataset
+    std::mt19937 gen(seed);
+    std::uniform_int_distribution<> distrib(0, N - 1);
+
+    std::cout << "Initializing centroids using random seed: " << seed << std::endl;
     for(int k = 0; k < K; ++k) {
+        int random_idx = distrib(gen);
         for(int d = 0; d < D; ++d) {
-            h_centroids[k * D + d] = h_points_SoA[d * N + k];
+            h_centroids[k * D + d] = h_points_SoA[d * N + random_idx];
         }
     }
 
@@ -131,8 +142,25 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMemcpy(d_centroids, h_centroids, centroids_bytes, cudaMemcpyHostToDevice));
 
     // 4. Calculate generic kernel launch parameters
-    int minGridSize, blockSize;
     size_t sharedMemSize = static_cast<size_t>(K) * D * sizeof(float);
+
+    // Query Device Limits & Opt-In to Extended Shared Memory
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+
+    if (sharedMemSize > prop.sharedMemPerBlockOptin) {
+        std::cerr << "\n[ERROR] Required shared memory (" << sharedMemSize 
+                  << " bytes) exceeds the absolute hardware limit for this GPU (" 
+                  << prop.sharedMemPerBlockOptin << " bytes)." << std::endl;
+        return 1;
+    }
+
+    // Explicitly opt-in to use up to 164 KB of shared memory on A100 architectures
+    CHECK_CUDA(cudaFuncSetAttribute(assignClustersKernel_Opt, 
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, 
+                                    sharedMemSize));
+
+    int minGridSize, blockSize = 0;
 
     // We base the occupancy calculation on the largest chunk size
     CHECK_CUDA(cudaOccupancyMaxPotentialBlockSize(
@@ -140,9 +168,15 @@ int main(int argc, char** argv) {
         assignClustersKernel_Opt, 
         sharedMemSize, N)); 
 
+    if (blockSize == 0) {
+        std::cerr << "[ERROR] cudaOccupancyMaxPotentialBlockSize failed to assign a valid block size." << std::endl;
+        return 1;
+    }
+
     std::cout << "--- Launch Configuration (Optimized, Chunked SoA) ---" << std::endl;
     std::cout << "N=" << N << " D=" << D << " K=" << K << std::endl;
     std::cout << "Block Size: " << blockSize << std::endl;
+    std::cout << "Shared Memory Allocated: " << sharedMemSize << " bytes" << std::endl;
 
     // Create CUDA events for profiling
     cudaEvent_t start, stop;
