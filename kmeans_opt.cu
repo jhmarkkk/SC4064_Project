@@ -1,4 +1,5 @@
 #include "sbin.hh"
+#include "save_results.hh"
 
 #include <cuda_runtime.h>
 #include <iostream>
@@ -122,21 +123,23 @@ __global__ void recalcCentroidsKernel_Opt(
         atomicAdd(&centroid_counts[i], s_counts[i]);
 }
 
-// =============================================================================
-// Host helper: divide accumulated sums by counts → new centroid positions
-// =============================================================================
-void computeNewCentroids(const float* centroid_sums,
-                         const int*   centroid_counts,
-                               float* centroids,
-                         int K, int D)
+// Kernel 3: Divide sums by counts entirely on GPU — no host roundtrip needed
+__global__ void updateCentroidsKernel(const float* __restrict__ centroid_sums,
+                                      const int*   __restrict__ centroid_counts,
+                                            float* __restrict__ centroids,
+                                      int K, int D)
 {
-    for (int k = 0; k < K; ++k) {
-        int count = centroid_counts[k];
-        for (int d = 0; d < D; ++d)
-            centroids[k * D + d] = (count > 0)
-                                   ? centroid_sums[k * D + d] / (float)count
-                                   : 0.0f;
-    }
+    // Each thread handles one (cluster, dimension) pair
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= K * D) return;
+
+    int k = idx / D;  // which cluster
+    int d = idx % D;  // which dimension
+
+    int count = centroid_counts[k];
+    centroids[idx] = (count > 0)
+                     ? centroid_sums[idx] / (float)count
+                     : 0.0f;
 }
 
 // =============================================================================
@@ -186,9 +189,6 @@ int main(int argc, char** argv)
     CHECK_CUDA(cudaMallocHost(&h_points_SoA,  total_points_bytes));
     CHECK_CUDA(cudaMallocHost(&h_centroids,    centroids_bytes));
     CHECK_CUDA(cudaMallocHost(&h_assignments,  total_assign_bytes));
-
-    std::vector<float> h_centroid_sums(static_cast<size_t>(K) * D, 0.0f);
-    std::vector<int>   h_centroid_counts(K, 0);
 
     if (!loadSbinSoA(argv[1], h_points_SoA, N, D)) return 1;
 
@@ -297,6 +297,24 @@ int main(int argc, char** argv)
 
         cudaEventRecord(start, 0);
 
+        // --- Copy points over once ---
+        for (int i = 0; i < num_streams; ++i) {
+            int    chunk  = stream_sizes[i];
+            size_t offset = stream_offsets[i];
+            if (chunk == 0) continue;
+            size_t width_bytes = static_cast<size_t>(chunk) * sizeof(float);
+            size_t pitch_bytes = static_cast<size_t>(N) * sizeof(float);
+
+            // Async H2D transfer for this chunk (SoA strided copy)
+            CHECK_CUDA(cudaMemcpy2DAsync(
+                d_points_SoA + offset, pitch_bytes,
+                h_points_SoA + offset, pitch_bytes,
+                width_bytes, D,
+                cudaMemcpyHostToDevice, streams[i]));
+
+            }
+        CHECK_CUDA(cudaDeviceSynchronize());  // wait for all chunks uploaded
+
         // ── K-means iteration loop ──
         for (int iter = 0; iter < max_iters; ++iter) {
 
@@ -307,15 +325,6 @@ int main(int argc, char** argv)
                 if (chunk == 0) continue;
 
                 int    gSize       = (chunk + blockSize - 1) / blockSize;
-                size_t width_bytes = static_cast<size_t>(chunk) * sizeof(float);
-                size_t pitch_bytes = static_cast<size_t>(N) * sizeof(float);
-
-                // Async H2D transfer for this chunk (SoA strided copy)
-                CHECK_CUDA(cudaMemcpy2DAsync(
-                    d_points_SoA + offset, pitch_bytes,
-                    h_points_SoA + offset, pitch_bytes,
-                    width_bytes, D,
-                    cudaMemcpyHostToDevice, streams[i]));
 
                 // Assignment kernel
                 assignClustersKernel_Opt<<<gSize, blockSize, assignSharedMem, streams[i]>>>(
@@ -347,18 +356,11 @@ int main(int argc, char** argv)
 
             CHECK_CUDA(cudaDeviceSynchronize());
 
-            // --- Step 4: Copy sums/counts to host, compute new centroids ---
-            CHECK_CUDA(cudaMemcpy(h_centroid_sums.data(),   d_centroid_sums,
-                                  centroids_bytes,  cudaMemcpyDeviceToHost));
-            CHECK_CUDA(cudaMemcpy(h_centroid_counts.data(), d_centroid_counts,
-                                  K * sizeof(int),  cudaMemcpyDeviceToHost));
-
-            computeNewCentroids(h_centroid_sums.data(), h_centroid_counts.data(),
-                                h_centroids, K, D);
-
-            // --- Step 5: Upload new centroids to device ---
-            CHECK_CUDA(cudaMemcpy(d_centroids, h_centroids,
-                                  centroids_bytes, cudaMemcpyHostToDevice));
+            // --- Step 4: Updating Centroid Kernel ---
+            int kd_total  = K * D;
+            int kd_blocks = (kd_total + blockSize - 1) / blockSize;
+            updateCentroidsKernel<<<kd_blocks, blockSize>>>(
+                d_centroid_sums, d_centroid_counts, d_centroids, K, D);
         }
 
         cudaEventRecord(stop, 0);
@@ -368,9 +370,76 @@ int main(int argc, char** argv)
         cudaEventElapsedTime(&ms, start, stop);
         double seconds = ms / 1000.0;
 
-        double total_bytes       = (double)N * (8.0 * D + 8.0);
-        double effective_bw_GBs  = (total_bytes / 1e9) / seconds;
-        double total_flops       = 3.0 * (double)N * K * D * max_iters;
+        // ── Performance Metrics ──
+        //
+        // Timing brackets: cudaEventRecord(start) → cudaEventRecord(stop)
+        // This includes the one-time point upload + all iteration kernels.
+        //
+        // ── Bandwidth ──
+        //
+        // One-time H2D point upload (inside timing, happens once per stream sweep):
+        //   N*D floats uploaded to device
+        //   Total: N * D * 4 bytes
+        //
+        // Kernel 1 — assignment (per iteration):
+        //   Reads : N*D floats (points from HBM) + K*D floats (centroids, shared mem load)
+        //   Writes: N ints (assignments to global memory)
+        //   D2H   : N ints (async copy of assignments back to host per stream)
+        //   Total : N*D*4 + K*D*4 + N*4 + N*4
+        //
+        // Kernel 2 — recalc (per iteration):
+        //   Reads : N*D floats (points) + N ints (assignments)
+        //   Writes: K*D floats (centroid sums) + K ints (centroid counts)
+        //   Total : N*D*4 + N*4 + K*D*4 + K*4
+        //
+        // Kernel 3 — update (per iteration):
+        //   Reads : K*D floats (sums) + K ints (counts)
+        //   Writes: K*D floats (new centroids)
+        //   Total : K*D*4 + K*4 + K*D*4
+
+        double bytes_upload = (double)N * D * 4;  // one-time point upload
+
+        double bytes_assign = (double)N * D * 4   // read points
+                            + (double)K * D * 4   // read centroids (shared mem load)
+                            + (double)N * 4       // write assignments
+                            + (double)N * 4;      // D2H assignments copy per stream
+
+        double bytes_recalc = (double)N * D * 4   // read points
+                            + (double)N * 4       // read assignments
+                            + (double)K * D * 4   // write centroid sums
+                            + (double)K * 4;      // write centroid counts
+
+        double bytes_update = (double)K * D * 4   // read centroid sums
+                            + (double)K * 4       // read centroid counts
+                            + (double)K * D * 4;  // write new centroids
+
+        double total_bytes      = bytes_upload
+                                + (bytes_assign + bytes_recalc + bytes_update) * max_iters;
+        double effective_bw_GBs = (total_bytes / 1e9) / seconds;
+
+        // ── FLOP count ──
+        //
+        // Kernel 1 — assignment (per iteration):
+        //   Per point, per cluster, per dimension: subtract + multiply + add = 3 FLOPs
+        //   Total: N * K * D * 3
+        //
+        // Kernel 2 — recalc (per iteration):
+        //   Per point per dimension: 1 atomicAdd to shared mem = 1 FLOP
+        //   Per point: 1 atomicAdd to shared count = 1 FLOP
+        //   Total: N * D + N = N * (D + 1)
+        //
+        // Kernel 3 — update (per iteration):
+        //   Per (cluster, dimension): 1 divide = 1 FLOP
+        //   Total: K * D
+        //
+        // Note: flops_assign dominates heavily.
+        //   Example N=5M, K=50, D=32:
+        //   flops_assign = 24 billion vs flops_recalc = 165 million vs flops_update = 1600
+
+        double flops_assign      = 3.0 * (double)N * K * D;
+        double flops_recalc      = (double)N * (D + 1);
+        double flops_update      = (double)K * D;
+        double total_flops       = (flops_assign + flops_recalc + flops_update) * max_iters;
         double throughput_GFLOPS = (total_flops / 1e9) / seconds;
 
         std::cout << "--- Performance Metrics (streams=" << num_streams << ") ---" << std::endl;
@@ -387,6 +456,30 @@ int main(int argc, char** argv)
         for (int i = 0; i < num_streams; ++i)
             CHECK_CUDA(cudaStreamDestroy(streams[i]));
     }
+
+    // ── Copy final results from device to host ──
+    CHECK_CUDA(cudaMemcpy(h_centroids, d_centroids,
+                        centroids_bytes, cudaMemcpyDeviceToHost));
+    // h_assignments is already up to date — last iteration's D2H async copy
+    // has completed before cudaEventRecord(stop) + cudaEventSynchronize(stop)
+
+    // ── Wrap raw pointers in vectors for save functions ──
+    std::vector<int>   v_assignments(h_assignments, h_assignments + N);
+    std::vector<float> v_centroids(h_centroids,    h_centroids   + K * D);
+
+    // ── Save results ──
+    std::string input_path = argv[1];
+    std::string base = input_path.substr(input_path.find_last_of("/\\") + 1);
+    base = base.substr(0, base.find_last_of('.'));
+    std::string tag    = "optimised";
+    std::string outdir = "optimised_results";
+    system(("mkdir -p " + outdir).c_str());
+    std::string prefix = outdir + "/" + base + "_" + tag;
+
+    saveAssignmentsCSV(v_assignments,        prefix + "_assignments.csv");
+    saveCentroidsCSV  (v_centroids,  K, D,   prefix + "_centroids.csv");
+    saveAssignmentsBin(v_assignments,        prefix + "_assignments.bin");
+    saveCentroidsBin  (v_centroids,  K, D,   prefix + "_centroids.bin");
 
     std::cout << "--------------------------------------------------" << std::endl;
     std::cout << "N=" << N << "  D=" << D << "  K=" << K << std::endl;

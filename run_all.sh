@@ -25,16 +25,16 @@ for file in "${SBIN_FILES[@]}"; do
 
     if [ "$MODE" == "profile" ]; then
         echo "--> Profiling Baseline..."
-        nsys profile --trace=cuda --stats=true --force-overwrite true -o "baseline_${FILENAME}" ./dist_assign "$file"
+        nsys profile --trace=cuda --stats=true --force-overwrite true -o "baseline_${FILENAME}" ./kmeans "$file"
         
         echo "--> Profiling Optimized Pipeline..."
-        nsys profile --trace=cuda --stats=true --force-overwrite true -o "opt_${FILENAME}" ./dist_assign_opt "$file"
+        nsys profile --trace=cuda --stats=true --force-overwrite true -o "opt_${FILENAME}" ./kmeans_opt "$file"
     else
         echo "--> Running Baseline..."
-        ./dist_assign "$file"
+        ./kmeans "$file"
         
         echo "--> Running Optimized Pipeline..."
-        ./dist_assign_opt "$file"
+        ./kmeans_opt "$file"
     fi
     echo ""
 done

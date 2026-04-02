@@ -5,3 +5,7 @@
 .vscode
 dist_assign
 dist_assign_opt
+baseline_results
+optimised_results
+kmeans
+kmeans_opt

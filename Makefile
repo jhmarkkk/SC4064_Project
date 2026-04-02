@@ -16,18 +16,18 @@ WARN_FLAGS  := -Xcompiler -Wall,-Wextra
 
 NVCC_FLAGS  := $(CXX_STD) $(ARCH) $(OPT_FLAGS) $(WARN_FLAGS)
 
-TARGETS     := dist_assign dist_assign_opt
+TARGETS     := kmeans kmeans_opt
 
 .PHONY: all run profile clean
 
 all: $(TARGETS)
 
 # Build baseline
-dist_assign: dist_assign.cu sbin.cc
+kmeans: kmeans.cu sbin.cc
 	$(NVCC) $(NVCC_FLAGS) $^ -o $@
 
 # Build optimized version
-dist_assign_opt: dist_assign_opt.cu sbin.cc
+kmeans_opt: kmeans_opt.cu sbin.cc
 	$(NVCC) $(NVCC_FLAGS) $^ -o $@
 
 # Execute standard run script
