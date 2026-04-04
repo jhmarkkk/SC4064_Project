@@ -173,9 +173,6 @@ int main(int argc, char** argv)
     CHECK_CUDA(cudaMalloc(&d_centroid_sums,   centroids_size));
     CHECK_CUDA(cudaMalloc(&d_centroid_counts, K * sizeof(int)));
 
-    CHECK_CUDA(cudaMemcpy(d_points, h_points.data(), points_size, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_centroids, h_centroids.data(), centroids_size, cudaMemcpyHostToDevice));
-
     // ── Shared memory for assignment kernel ──
     size_t sharedMemSize = static_cast<size_t>(K) * D * sizeof(float);
 
@@ -225,6 +222,9 @@ int main(int argc, char** argv)
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start, 0);
+
+    CHECK_CUDA(cudaMemcpy(d_points, h_points.data(), points_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_centroids, h_centroids.data(), centroids_size, cudaMemcpyHostToDevice));
 
     // ── K-means iteration loop ──
     for (int iter = 0; iter < max_iters; ++iter) {

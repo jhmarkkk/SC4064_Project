@@ -301,24 +301,24 @@ int main(int argc, char** argv)
 
         cudaEventRecord(start, 0);
 
-        // --- Copy points over once ---
-        for (int i = 0; i < num_streams; ++i) {
-            int    chunk  = stream_sizes[i];
-            size_t offset = stream_offsets[i];
-            if (chunk == 0) continue;
-            size_t width_bytes = static_cast<size_t>(chunk) * sizeof(float);
-            size_t pitch_bytes = static_cast<size_t>(N) * sizeof(float);
-
-            // Async H2D transfer for this chunk (SoA strided copy)
-            CHECK_CUDA(cudaMemcpy2DAsync(
-                d_points_SoA + offset, pitch_bytes,
-                h_points_SoA + offset, pitch_bytes,
-                width_bytes, D,
-                cudaMemcpyHostToDevice, streams[i]));
-
-            }
-        CHECK_CUDA(cudaDeviceSynchronize());  // wait for all chunks uploaded
-
+            // --- Copy points over once ---
+            for (int i = 0; i < num_streams; ++i) {
+                int    chunk  = stream_sizes[i];
+                size_t offset = stream_offsets[i];
+                if (chunk == 0) continue;
+                size_t width_bytes = static_cast<size_t>(chunk) * sizeof(float);
+                size_t pitch_bytes = static_cast<size_t>(N) * sizeof(float);
+                
+                // Async H2D transfer for this chunk (SoA strided copy)
+                CHECK_CUDA(cudaMemcpy2DAsync(
+                    d_points_SoA + offset, pitch_bytes,
+                    h_points_SoA + offset, pitch_bytes,
+                    width_bytes, D,
+                    cudaMemcpyHostToDevice, streams[i]));
+                    
+                }
+                CHECK_CUDA(cudaDeviceSynchronize());  // wait for all chunks uploaded
+                
         // ── K-means iteration loop ──
         for (int iter = 0; iter < max_iters; ++iter) {
 
@@ -366,6 +366,10 @@ int main(int argc, char** argv)
             updateCentroidsKernel<<<kd_blocks, blockSize>>>(
                 d_centroid_sums, d_centroid_counts, d_centroids, K, D);
         }
+
+        // ── Copy final results from device to host ──
+        CHECK_CUDA(cudaMemcpy(h_centroids, d_centroids,
+                        centroids_bytes, cudaMemcpyDeviceToHost));
 
         cudaEventRecord(stop, 0);
         cudaEventSynchronize(stop);
@@ -460,12 +464,6 @@ int main(int argc, char** argv)
         for (int i = 0; i < num_streams; ++i)
             CHECK_CUDA(cudaStreamDestroy(streams[i]));
     }
-
-    // ── Copy final results from device to host ──
-    CHECK_CUDA(cudaMemcpy(h_centroids, d_centroids,
-                        centroids_bytes, cudaMemcpyDeviceToHost));
-    // h_assignments is already up to date — last iteration's D2H async copy
-    // has completed before cudaEventRecord(stop) + cudaEventSynchronize(stop)
 
     // ── Wrap raw pointers in vectors for save functions ──
     std::vector<int>   v_assignments(h_assignments, h_assignments + N);
