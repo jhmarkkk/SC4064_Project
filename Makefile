@@ -23,11 +23,11 @@ TARGETS     := kmeans kmeans_opt
 all: $(TARGETS)
 
 # Build baseline
-kmeans: kmeans.cu sbin.cc
+kmeans: kmeans.cu sbin.cc | common_kernels.hh save_results.hh
 	$(NVCC) $(NVCC_FLAGS) $^ -o $@
 
 # Build optimized version
-kmeans_opt: kmeans_opt.cu sbin.cc
+kmeans_opt: kmeans_opt.cu sbin.cc | common_kernels.hh save_results.hh
 	$(NVCC) $(NVCC_FLAGS) $^ -o $@
 
 # Execute standard run script

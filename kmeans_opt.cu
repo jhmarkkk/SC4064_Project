@@ -1,4 +1,5 @@
 #include "sbin.hh"
+#include "common_kernels.hh"
 #include "save_results.hh"
 
 #include <cuda_runtime.h>
@@ -176,7 +177,7 @@ int main(int argc, char** argv)
     int seed = 42;
     if (argc >= 4) seed = std::stoi(argv[3]);
 
-    int max_iters = 100;
+    int max_iters = 20;
     if (argc >= 5) max_iters = std::stoi(argv[4]);
 
     size_t total_points_bytes  = static_cast<size_t>(N) * D * sizeof(float);
@@ -196,7 +197,7 @@ int main(int argc, char** argv)
     std::mt19937 gen(seed);
     std::uniform_int_distribution<> distrib(0, N - 1);
 
-    std::cout << "Initializing centroids using random seed: " << seed << std::endl;
+    std::cerr << "Initializing centroids using random seed: " << seed << std::endl;
     for (int k = 0; k < K; ++k) {
         int idx = distrib(gen);
         for (int d = 0; d < D; ++d)
@@ -241,6 +242,9 @@ int main(int argc, char** argv)
     CHECK_CUDA(cudaFuncSetAttribute(recalcCentroidsKernel_Opt,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     recalcSharedMem));
+    CHECK_CUDA(cudaFuncSetAttribute(computeInertiaKernel, 
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, 
+                                assignSharedMem));
 
     int minGridSize, blockSize = 0;
     CHECK_CUDA(cudaOccupancyMaxPotentialBlockSize(
@@ -258,14 +262,14 @@ int main(int argc, char** argv)
         &numBlocksPerSM, assignClustersKernel_Opt, blockSize, assignSharedMem);
     float occupancy = (numBlocksPerSM * blockSize) / (float)prop.maxThreadsPerMultiProcessor;
 
-    std::cout << "--- Launch Configuration ---" << std::endl;
-    std::cout << "N=" << N << "  D=" << D << "  K=" << K
+    std::cerr << "--- Launch Configuration ---" << std::endl;
+    std::cerr << "N=" << N << "  D=" << D << "  K=" << K
               << "  max_iters=" << max_iters << std::endl;
-    std::cout << "Block size            : " << blockSize << std::endl;
-    std::cout << "Theoretical occupancy : " << std::fixed << std::setprecision(2)
+    std::cerr << "Block size            : " << blockSize << std::endl;
+    std::cerr << "Theoretical occupancy : " << std::fixed << std::setprecision(2)
               << (occupancy * 100.0f) << "%" << std::endl;
-    std::cout << "Assign shared mem     : " << assignSharedMem << " bytes" << std::endl;
-    std::cout << "Recalc shared mem     : " << recalcSharedMem << " bytes" << std::endl;
+    std::cerr << "Assign shared mem     : " << assignSharedMem << " bytes" << std::endl;
+    std::cerr << "Recalc shared mem     : " << recalcSharedMem << " bytes" << std::endl;
 
     // ── Stream sweep to find optimal stream count ──
     std::vector<int> test_streams = {1, 2, 4, 8, 16, 32};
@@ -277,7 +281,7 @@ int main(int argc, char** argv)
     cudaEventCreate(&stop);
 
     for (int num_streams : test_streams) {
-        std::cout << "\nTesting NUM_STREAMS = " << num_streams << " ..." << std::endl;
+        std::cerr << "\nTesting NUM_STREAMS = " << num_streams << " ..." << std::endl;
 
         // Chunk layout
         std::vector<int>    stream_sizes(num_streams, 0);
@@ -442,11 +446,11 @@ int main(int argc, char** argv)
         double total_flops       = (flops_assign + flops_recalc + flops_update) * max_iters;
         double throughput_GFLOPS = (total_flops / 1e9) / seconds;
 
-        std::cout << "--- Performance Metrics (streams=" << num_streams << ") ---" << std::endl;
-        std::cout << "Total time         : " << ms << " ms" << std::endl;
-        std::cout << "Time per iteration : " << ms / max_iters << " ms" << std::endl;
-        std::cout << "Effective BW       : " << effective_bw_GBs << " GB/s" << std::endl;
-        std::cout << "Throughput         : " << throughput_GFLOPS << " GFLOPS" << std::endl;
+        std::cerr << "--- Performance Metrics (streams=" << num_streams << ") ---" << std::endl;
+        std::cerr << "Total time         : " << ms << " ms" << std::endl;
+        std::cerr << "Time per iteration : " << ms / max_iters << " ms" << std::endl;
+        std::cerr << "Effective BW       : " << effective_bw_GBs << " GB/s" << std::endl;
+        std::cerr << "Throughput         : " << throughput_GFLOPS << " GFLOPS" << std::endl;
 
         if (ms < best_time) {
             best_time         = ms;
@@ -478,15 +482,40 @@ int main(int argc, char** argv)
 
     saveAssignmentsCSV(v_assignments,        prefix + "_assignments.csv");
     saveCentroidsCSV  (v_centroids,  K, D,   prefix + "_centroids.csv");
-    saveAssignmentsBin(v_assignments,        prefix + "_assignments.bin");
-    saveCentroidsBin  (v_centroids,  K, D,   prefix + "_centroids.bin");
 
-    std::cout << "--------------------------------------------------" << std::endl;
-    std::cout << "N=" << N << "  D=" << D << "  K=" << K << std::endl;
-    std::cout << "Block size     : " << blockSize << std::endl;
-    std::cout << "Best streams   : " << best_stream_count
+    std::cerr << "--------------------------------------------------" << std::endl;
+    std::cerr << "N=" << N << "  D=" << D << "  K=" << K << std::endl;
+    std::cerr << "Block size     : " << blockSize << std::endl;
+    std::cerr << "Best streams   : " << best_stream_count
               << "  (" << best_time << " ms total, "
               << best_time / max_iters << " ms/iter)" << std::endl;
+
+    // Inertia computation
+    double* d_inertia;
+    CHECK_CUDA(cudaMalloc(&d_inertia, sizeof(double)));
+    CHECK_CUDA(cudaMemset(d_inertia, 0, sizeof(double)));
+    computeInertiaKernel<<<gridSize, blockSize, assignSharedMem>>>(
+        d_points_SoA, d_centroids, d_assignments,
+        d_inertia, N, K, D);
+
+    double h_inertia = 0.0;
+    CHECK_CUDA(cudaMemcpy(&h_inertia, d_inertia, sizeof(double),
+                        cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaFree(d_inertia));
+    std::cerr << "Final inertia: " << std::fixed << std::setprecision(2)
+            << h_inertia << std::endl;
+
+    // cout into csv files
+    std::cout << base << ","
+          << N << ","
+          << K << ","
+          << D << ","
+          << std::fixed << std::setprecision(6) << best_time / 1000.0 << ","
+          << best_time / 1000.0 / max_iters << ","
+          << max_iters << ","
+          << std::setprecision(2) << h_inertia << ","
+          << "optimised"
+          << std::endl;
 
     // ── Cleanup ──
     cudaEventDestroy(start);

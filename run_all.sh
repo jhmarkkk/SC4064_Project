@@ -2,6 +2,7 @@
 
 DATA_DIR="data_bin"
 MODE=$1
+RESULTS_CSV="gpu_results.csv"
 
 if [ ! -d "$DATA_DIR" ]; then
     echo "Error: Directory '$DATA_DIR' does not exist."
@@ -17,6 +18,9 @@ if [ ${#SBIN_FILES[@]} -eq 0 ]; then
     exit 1
 fi
 
+# Write CSV header once
+echo "dataset_file,n_points,k_clusters,n_dims,total_time_s,time_per_iter_s,n_iters,final_inertia,version" > "$RESULTS_CSV"
+
 for file in "${SBIN_FILES[@]}"; do
     FILENAME=$(basename "$file")
     echo "=================================================="
@@ -31,10 +35,10 @@ for file in "${SBIN_FILES[@]}"; do
         nsys profile --trace=cuda --stats=true --force-overwrite true -o "opt_${FILENAME}" ./kmeans_opt "$file"
     else
         echo "--> Running Baseline..."
-        ./kmeans "$file"
+        ./kmeans "$file" >> "$RESULTS_CSV"
         
         echo "--> Running Optimized Pipeline..."
-        ./kmeans_opt "$file"
+        ./kmeans_opt "$file" >> "$RESULTS_CSV"
     fi
     echo ""
 done

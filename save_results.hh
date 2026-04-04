@@ -13,7 +13,7 @@ inline void saveAssignmentsCSV(const std::vector<int>& assignments,
     out << "point_idx,cluster\n";
     for (int i = 0; i < (int)assignments.size(); ++i)
         out << i << "," << assignments[i] << "\n";
-    std::cout << "Saved: " << filepath << std::endl;
+    std::cerr << "Saved: " << filepath << std::endl;
 }
 
 inline void saveCentroidsCSV(const std::vector<float>& centroids,
@@ -34,7 +34,7 @@ inline void saveCentroidsCSV(const std::vector<float>& centroids,
         }
         out << "\n";
     }
-    std::cout << "Saved: " << filepath << std::endl;
+    std::cerr << "Saved: " << filepath << std::endl;
 }
 
 inline void saveAssignmentsBin(const std::vector<int>& assignments,
@@ -46,7 +46,7 @@ inline void saveAssignmentsBin(const std::vector<int>& assignments,
     out.write(reinterpret_cast<const char*>(&N), sizeof(int));
     out.write(reinterpret_cast<const char*>(assignments.data()),
               static_cast<size_t>(N) * sizeof(int));
-    std::cout << "Saved: " << filepath << std::endl;
+    std::cerr << "Saved: " << filepath << std::endl;
 }
 
 inline void saveCentroidsBin(const std::vector<float>& centroids,
@@ -59,5 +59,5 @@ inline void saveCentroidsBin(const std::vector<float>& centroids,
     out.write(reinterpret_cast<const char*>(&D), sizeof(int));
     out.write(reinterpret_cast<const char*>(centroids.data()),
               static_cast<size_t>(K) * D * sizeof(float));
-    std::cout << "Saved: " << filepath << std::endl;
+    std::cerr << "Saved: " << filepath << std::endl;
 }

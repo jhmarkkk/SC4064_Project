@@ -1,4 +1,5 @@
 #include "sbin.hh"
+#include "common_kernels.hh"
 #include "save_results.hh"
 
 #include <cuda_runtime.h>
@@ -137,7 +138,7 @@ int main(int argc, char** argv)
     int seed = 42;
     if (argc >= 4) seed = std::stoi(argv[3]);
 
-    int max_iters = 100;
+    int max_iters = 20;
     if (argc >= 5) max_iters = std::stoi(argv[4]);
 
     size_t points_size      = static_cast<size_t>(N) * D * sizeof(float);
@@ -155,7 +156,7 @@ int main(int argc, char** argv)
     std::mt19937 gen(seed);
     std::uniform_int_distribution<> distrib(0, N - 1);
 
-    std::cout << "Initializing centroids using random seed: " << seed << std::endl;
+    std::cerr << "Initializing centroids using random seed: " << seed << std::endl;
     for (int k = 0; k < K; ++k) {
         int idx = distrib(gen);
         for (int d = 0; d < D; ++d)
@@ -192,6 +193,10 @@ int main(int argc, char** argv)
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     sharedMemSize));
 
+    CHECK_CUDA(cudaFuncSetAttribute(computeInertiaKernel, 
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, 
+                                sharedMemSize));
+
     int minGridSize, blockSize = 0;
     CHECK_CUDA(cudaOccupancyMaxPotentialBlockSize(
         &minGridSize, &blockSize, assignClustersKernel, sharedMemSize, N));
@@ -208,11 +213,11 @@ int main(int argc, char** argv)
         &numBlocksPerSM, assignClustersKernel, blockSize, sharedMemSize);
     float occupancy = (numBlocksPerSM * blockSize) / (float)prop.maxThreadsPerMultiProcessor;
 
-    std::cout << "--- Launch Configuration ---" << std::endl;
-    std::cout << "N=" << N << "  D=" << D << "  K=" << K
+    std::cerr << "--- Launch Configuration ---" << std::endl;
+    std::cerr << "N=" << N << "  D=" << D << "  K=" << K
               << "  max_iters=" << max_iters << std::endl;
-    std::cout << "Block size           : " << blockSize << std::endl;
-    std::cout << "Theoretical occupancy: " << std::fixed << std::setprecision(2)
+    std::cerr << "Block size           : " << blockSize << std::endl;
+    std::cerr << "Theoretical occupancy: " << std::fixed << std::setprecision(2)
               << (occupancy * 100.0f) << "%" << std::endl;
 
     // ── CUDA events for timing the full clustering loop ──
@@ -266,8 +271,6 @@ int main(int argc, char** argv)
     std::string prefix = outdir + "/" + base + "_" + tag;
     saveAssignmentsCSV(h_assignments,     prefix + "_assignments.csv");
     saveCentroidsCSV  (h_centroids, K, D, prefix + "_centroids.csv");
-    saveAssignmentsBin(h_assignments,     prefix + "_assignments.bin");
-    saveCentroidsBin  (h_centroids, K, D, prefix + "_centroids.bin");
 
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
@@ -308,15 +311,42 @@ int main(int argc, char** argv)
     double total_flops  = (flops_assign + flops_recalc + flops_update) * max_iters;
     double throughput_GFLOPS = (total_flops / 1e9) / seconds;
 
-    std::cout << "\n--- Performance Metrics ---" << std::endl;
-    std::cout << "Total points (N)    : " << N << std::endl;
-    std::cout << "Dimensions (D)      : " << D << std::endl;
-    std::cout << "Clusters (K)        : " << K << std::endl;
-    std::cout << "Iterations          : " << max_iters << std::endl;
-    std::cout << "Total time          : " << milliseconds << " ms" << std::endl;
-    std::cout << "Time per iteration  : " << milliseconds / max_iters << " ms" << std::endl;
-    std::cout << "Effective bandwidth : " << effective_bw_GBs << " GB/s" << std::endl;
-    std::cout << "Throughput          : " << throughput_GFLOPS << " GFLOPS" << std::endl;
+    std::cerr << "\n--- Performance Metrics ---" << std::endl;
+    std::cerr << "Total points (N)    : " << N << std::endl;
+    std::cerr << "Dimensions (D)      : " << D << std::endl;
+    std::cerr << "Clusters (K)        : " << K << std::endl;
+    std::cerr << "Iterations          : " << max_iters << std::endl;
+    std::cerr << "Total time          : " << milliseconds << " ms" << std::endl;
+    std::cerr << "Time per iteration  : " << milliseconds / max_iters << " ms" << std::endl;
+    std::cerr << "Effective bandwidth : " << effective_bw_GBs << " GB/s" << std::endl;
+    std::cerr << "Throughput          : " << throughput_GFLOPS << " GFLOPS" << std::endl;
+
+    // Inertia computation
+    double* d_inertia;
+    CHECK_CUDA(cudaMalloc(&d_inertia, sizeof(double)));
+    CHECK_CUDA(cudaMemset(d_inertia, 0, sizeof(double)));
+    computeInertiaKernel<<<gridSize, blockSize, sharedMemSize>>>(
+        d_points, d_centroids, d_assignments,
+        d_inertia, N, K, D);
+
+    double h_inertia = 0.0;
+    CHECK_CUDA(cudaMemcpy(&h_inertia, d_inertia, sizeof(double),
+                        cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaFree(d_inertia));
+    std::cerr << "Final inertia: " << std::fixed << std::setprecision(2)
+            << h_inertia << std::endl;
+
+    // cout into csv files
+    std::cout << base << ","
+          << N << ","
+          << K << ","
+          << D << ","
+          << std::fixed << std::setprecision(6) << seconds << ","
+          << seconds / max_iters << ","
+          << max_iters << ","
+          << std::setprecision(2) << h_inertia << ","
+          << "baseline"
+          << std::endl;
 
     // ── Cleanup ──
     cudaEventDestroy(start);
